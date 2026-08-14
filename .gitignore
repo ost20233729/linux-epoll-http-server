@@ -1,0 +1,5 @@
+minihttpd
+src/*.o
+logs/*.log
+*.md
+!README.md

@@ -1,0 +1,2 @@
+This file is served by minihttpd.
+Use a Range request to download only part of it.
