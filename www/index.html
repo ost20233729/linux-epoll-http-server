@@ -1,23 +1,120 @@
 <!doctype html>
 <html lang="zh-CN">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>minihttpd</title>
-        <link rel="stylesheet" href="/assets/style.css">
-    </head>
-    <body>
-        <main>
-            <p class="label">Linux C / epoll / HTTP/1.1</p>
-            <h1>minihttpd is running</h1>
-            <p>
-                Static files, directory listing, Keep-Alive, Range requests and access logs
-                are enabled.
-            </p>
-            <div class="actions">
-                <a href="/downloads/">Browse downloads</a>
-                <a href="/sample.txt">Open sample file</a>
-            </div>
-        </main>
-    </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>欧书团 · 个人主页</title>
+<style>
+  :root { --fg:#1d2733; --muted:#5a6b7d; --accent:#1a6fb5; --bg:#f7f9fb; --card:#ffffff; --line:#e3e9f0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"Segoe UI","Microsoft YaHei",-apple-system,sans-serif; color:var(--fg); background:var(--bg); line-height:1.7; }
+  .wrap { max-width:860px; margin:0 auto; padding:40px 20px 60px; }
+  header { text-align:center; margin-bottom:36px; }
+  h1 { font-size:2rem; letter-spacing:.5px; }
+  .sub { color:var(--muted); margin-top:6px; font-size:.95rem; }
+  .badges { margin-top:14px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+  .badge { background:#e8f1f9; color:var(--accent); border-radius:999px; padding:3px 14px; font-size:.85rem; }
+  h2 { font-size:1.15rem; margin:34px 0 14px; padding-left:10px; border-left:4px solid var(--accent); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:14px; }
+  .card h3 { font-size:1.02rem; }
+  .card h3 a { color:var(--fg); text-decoration:none; }
+  .card h3 a:hover { color:var(--accent); }
+  .card .meta { color:var(--muted); font-size:.85rem; margin:4px 0 8px; }
+  .card p { font-size:.92rem; }
+  .links { margin-top:10px; display:flex; gap:14px; flex-wrap:wrap; }
+  .links a { color:var(--accent); font-size:.88rem; text-decoration:none; border-bottom:1px dashed transparent; }
+  .links a:hover { border-bottom-color:var(--accent); }
+  .skills { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:4px 12px; font-size:.88rem; }
+  .note { background:#eef6ee; border:1px solid #cfe6cf; color:#2f6b33; border-radius:10px; padding:14px 18px; font-size:.9rem; }
+  footer { text-align:center; color:var(--muted); font-size:.8rem; margin-top:44px; }
+  footer a { color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>欧书团</h1>
+    <p class="sub">Dors Kian · 中南林业科技大学 · 软件工程 2027 届本科</p>
+    <div class="badges">
+      <span class="badge">求职中</span>
+      <span class="badge">意向：C++ 开发 / 技术支持 / 实施</span>
+      <span class="badge">湖南 · 长沙</span>
+    </div>
+  </header>
+
+  <h2>关于我</h2>
+  <div class="card">
+    <p>软件工程专业大四学生，对 Linux 系统编程与网络编程有扎实的课设实践。现担任班长、中共预备党员。求职方向以 C++ 开发为主、技术支持与实施工程师为辅，希望把"能写代码、能讲清楚代码"变成自己的工作方式。</p>
+  </div>
+
+  <h2>技术栈</h2>
+  <div class="skills">
+    <span class="chip">C / C++</span>
+    <span class="chip">Linux 系统编程</span>
+    <span class="chip">epoll / 非阻塞 I/O</span>
+    <span class="chip">Boost.Asio</span>
+    <span class="chip">Qt6</span>
+    <span class="chip">MySQL / SQLite</span>
+    <span class="chip">Java / Spring</span>
+    <span class="chip">Git / Linux 运维</span>
+  </div>
+
+  <h2>项目</h2>
+
+  <div class="card">
+    <h3><a href="https://github.com/ost20233729/linux-epoll-http-server">linux-epoll-http-server</a></h3>
+    <div class="meta">C · Linux · epoll · HTTP/1.1 · 2025.11–12（网络编程课程设计）</div>
+    <p>从零实现单线程事件循环 HTTP 静态文件服务器：连接状态机、Keep-Alive、Range 请求、sendfile 大文件传输、路径穿越防护。</p>
+    <div class="links">
+      <a href="https://github.com/ost20233729/linux-epoll-http-server">GitHub 仓库</a>
+      <a href="http://8.138.29.208:8080">在线演示（就是本页面）</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><a href="https://github.com/ost20233729/sensor-data-acquisition">sensor-data-acquisition</a></h3>
+    <div class="meta">C++ · Qt6 · 串口协议 · 2026.07 至今（科研项目）</div>
+    <p>传感器数据采集与可视化系统：Qt 上位机实时曲线、二进制协议解析、线程安全队列与持久化，数据用于大模型训练。</p>
+    <div class="links">
+      <a href="https://github.com/ost20233729/sensor-data-acquisition">GitHub 仓库</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><a href="https://github.com/ost20233729/Teaching-Assistance">Teaching-Assistance</a></h3>
+    <div class="meta">Java · Spring · LLM 应用</div>
+    <p>教学辅助平台：接入大模型的内容生成与面试模拟，前后端分离。</p>
+    <div class="links">
+      <a href="https://github.com/ost20233729/Teaching-Assistance">GitHub 仓库</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><a href="https://github.com/ost20233729/lab-equipment-system">lab-equipment-system</a></h3>
+    <div class="meta">Java · Spring · 权限管理</div>
+    <p>实验室设备管理系统：多角色审批流程、设备借用状态机。</p>
+    <div class="links">
+      <a href="https://github.com/ost20233729/lab-equipment-system">GitHub 仓库</a>
+    </div>
+  </div>
+
+  <div class="note">
+    这个页面就运行在我自己用 C 语言写的 HTTP 服务器上。
+  </div>
+
+  <h2>联系我</h2>
+  <div class="card">
+    <p>邮箱：<a href="mailto:A18397274071@outlook.com">A18397274071@outlook.com</a>（Outlook）</p>
+    <p>GitHub：<a href="https://github.com/ost20233729">github.com/ost20233729</a></p>
+    <p>域名：ost101.me</p>
+  </div>
+
+  <footer>
+    © 2026 欧书团 · 托管于阿里云 ECS · <span>备案号待挂</span>
+  </footer>
+
+</div>
+</body>
 </html>
