@@ -38,6 +38,19 @@ static const char *config_file;
 static int epoll_fd = -1;   // epoll_fd — epoll 实例的文件描述符。整个服务器只有一个 epoll 实例，server_run 创建它
 static Connection *connections[MAX_CONNECTIONS];
 
+/* A/B 测试开关：MINIHTTPD_NO_SENDFILE=1 时文件发送走 read+send，
+ * 用于实测 sendfile 零拷贝的性能收益（见 docs/压测报告.md）。 */
+static int sendfileDisabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("MINIHTTPD_NO_SENDFILE");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
 /* 信号处理函数只修改退出标志，真正的资源释放由主循环完成。 */
 static void stop_server(int signal_number)
 {
@@ -1185,6 +1198,37 @@ static int handle_write(Connection *connection)
         connection->state = CONN_WRITING_FILE;
         while (connection->file_remaining > 0)
         {
+            // A/B 测试开关：环境变量 MINIHTTPD_NO_SENDFILE=1 时用 read+send
+            // 替代 sendfile，用于实测零拷贝的性能收益（见 docs/压测报告.md）
+            if (sendfileDisabled())
+            {
+                char buf[64 * 1024];
+                ssize_t n = read(connection->file_fd, buf, sizeof(buf));
+                if (n > 0)
+                {
+                    ssize_t sent = 0;
+                    while (sent < n)
+                    {
+                        ssize_t s = send(connection->fd, buf + sent,
+                                         (size_t)(n - sent), MSG_NOSIGNAL);
+                        if (s > 0) { sent += s; continue; }
+                        if (s < 0 && errno == EINTR) continue;
+                        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                            return 0;
+                        return -1;
+                    }
+                    connection->file_remaining -= (size_t)n;
+                    connection->file_offset += n;
+                    connection->last_active = time(NULL);
+                    continue;
+                }
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    return 0;
+                return -1;
+            }
+
             /* 每次最多提交 1 MiB，实际完成量仍以 sendfile 返回值为准。 */
             size_t block = connection->file_remaining > 1024 * 1024
                                ? 1024 * 1024
