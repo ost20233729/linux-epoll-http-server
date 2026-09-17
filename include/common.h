@@ -15,12 +15,21 @@
 #define MAX_CONNECTIONS 4096
 #define DEFAULT_PORT 8080
 #define DEFAULT_KEEPALIVE_TIMEOUT 10
+/* 单个上传文件的大小上限（64 MiB）。 */
+#define MAX_UPLOAD_SIZE (64 * 1024 * 1024)
+/* CGI 请求体缓冲上限（64 KiB，等于 Linux 管道容量，父进程可一次性写完不阻塞）。 */
+#define CGI_BODY_MAX (64 * 1024)
+/* CGI 输出缓冲上限（1 MiB），防止失控脚本耗尽服务器内存。 */
+#define CGI_OUTPUT_MAX (1024 * 1024)
+/* CGI 脚本最长执行时间（秒），超时强杀子进程并返回 504。 */
+#define CGI_TIMEOUT 5
 
-/* 当前核心版本只实现 GET 和 HEAD，其他方法统一返回 405。 */
+/* 请求方法；POST 用于上传文件，其余未支持的方法统一返回 405。 */
 typedef enum
 {
     METHOD_GET,
     METHOD_HEAD,
+    METHOD_POST,
     METHOD_UNSUPPORTED
 } HttpMethod;
 
@@ -35,6 +44,13 @@ typedef struct
     bool range_suffix;     /* 是否为 bytes=-N 形式的后缀范围。 */
     off_t range_start;     /* 起始位置；后缀范围中表示末尾字节数。 */
     off_t range_end;       /* 结束位置，-1 表示直到文件末尾。 */
+
+    /* 请求体：POST 上传的数据；其他方法携带请求体按错误处理。 */
+    bool has_content_length; /* 是否带有 Content-Length 请求头。 */
+    bool has_body;           /* Content-Length 是否大于 0。 */
+    bool chunked;            /* 是否为 chunked 传输编码（暂不支持）。 */
+    off_t content_length;    /* 请求体长度（字节）。 */
+    char content_type[128];  /* Content-Type 请求头，透传给 CGI 环境变量。 */
 } HttpRequest;
 
 /*
@@ -43,7 +59,9 @@ typedef struct
  */
 typedef enum
 {
-    CONN_READING,// 正在读取 HTTP 请求
+    CONN_READING,// 正在读取 HTTP 请求头
+    CONN_READING_BODY,// 正在接收 POST 请求体（上传写文件 / CGI 缓冲进内存）
+    CONN_RUNNING_CGI,// CGI 子进程运行中，等待其 stdout 管道输出
     CONN_WRITING_HEADER,// 正在发送响应头
     CONN_WRITING_MEMORY,
     CONN_WRITING_FILE
@@ -60,19 +78,37 @@ typedef struct Connection
     ConnectionState state;
     char client_ip[64];
 
-    /* 请求读取缓冲区：read_length 表示已经收到的字节数。 */
+    /* 请求读取缓冲区：read_length 表示已经收到的字节数。
+       接收 POST 请求体时，缓冲区同时用作传输中转。 */
     char read_buffer[READ_BUFFER_SIZE];
     size_t read_length;
+
+    /* POST 请求体接收进度：边收边写入上传文件，不整体缓存进内存。 */
+    off_t content_received;     /* 已收到的请求体字节数。 */
+    int upload_fd;              /* 上传目标文件描述符，-1 表示未打开。 */
+    char upload_path[PATH_MAX]; /* 上传文件绝对路径，失败时用于删除残留。 */
+
+    /* CGI 执行状态：/cgi-bin/ 下的脚本通过 fork/exec 运行。 */
+    int cgi_pid;                /* CGI 子进程 PID，-1 表示当前没有运行。 */
+    int cgi_input_fd;           /* 子进程 stdin 的写端（POST 请求体），-1 表示无。 */
+    int cgi_output_fd;          /* 子进程 stdout 的读端，加入 epoll 等待输出。 */
+    time_t cgi_started;         /* 子进程启动时间，用于超时终止。 */
+    int cgi_status;             /* CGI 响应头中的 Status，默认 200。 */
+    char cgi_content_type[64];  /* CGI 响应头中的 Content-Type。 */
+    bool cgi_request;           /* 请求体是否属于 CGI（缓冲进内存而非写文件）。 */
+    char *request_body;         /* CGI 请求体缓冲（≤ 64 KiB）。 */
+    size_t request_body_length; /* 已缓冲的请求体字节数。 */
 
     /* HTTP 响应头及其发送进度。 */
     char header_buffer[HEADER_BUFFER_SIZE];
     size_t header_length;
     size_t header_sent;
 
-    /* 动态生成的目录页面或错误页面及其发送进度。 */
+    /* 动态生成的页面或 CGI 输出缓冲及其发送进度。 */
     char *body;
     size_t body_length;
     size_t body_sent;
+    size_t body_capacity; /* body 缓冲区的已分配容量（CGI 增量追加时用）。 */
 
     /* 静态文件描述符、下一次发送位置和剩余字节数。 */
     int file_fd;

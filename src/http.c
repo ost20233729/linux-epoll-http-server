@@ -170,6 +170,8 @@ int http_parse_request(const char *buffer, size_t length, HttpRequest *request)
         request->method = METHOD_GET;
     else if (strcmp(method, "HEAD") == 0)
         request->method = METHOD_HEAD;
+    else if (strcmp(method, "POST") == 0)
+        request->method = METHOD_POST;
     else
         request->method = METHOD_UNSUPPORTED;
 
@@ -229,6 +231,22 @@ int http_parse_request(const char *buffer, size_t length, HttpRequest *request)
             else if (strcasecmp(value, "keep-alive") == 0)
                 request->keep_alive = true;
         }
+        else if (strcasecmp(name, "Content-Length") == 0)
+        {
+            // 与 parse_range 同理：strtoll 调用前先清 errno，再用 *end 检查是否完整解析
+            errno = 0;
+            char *end;
+            long long body = strtoll(value, &end, 10);
+            if (errno || *end || body < 0)
+                return -1;
+            request->content_length = (off_t)body;
+            request->has_content_length = true;
+            request->has_body = body > 0;
+        }
+        else if (strcasecmp(name, "Content-Type") == 0)
+            snprintf(request->content_type, sizeof(request->content_type), "%s", value);
+        else if (strcasecmp(name, "Transfer-Encoding") == 0 && strcasecmp(value, "chunked") == 0)
+            request->chunked = true;
         else if (strcasecmp(name, "Range") == 0 && parse_range(value, request) != 0)
             return -3;
 
@@ -244,6 +262,8 @@ const char *http_reason_phrase(int status)
     {
     case 200:
         return "OK";
+    case 201:
+        return "Created";
     case 206:
         return "Partial Content";
     case 301:
@@ -256,12 +276,20 @@ const char *http_reason_phrase(int status)
         return "Not Found";
     case 405:
         return "Method Not Allowed";
+    case 411:
+        return "Length Required";
+    case 413:
+        return "Payload Too Large";
     case 416:
         return "Range Not Satisfiable";
     case 431:
         return "Request Header Fields Too Large";
     case 500:
         return "Internal Server Error";
+    case 501:
+        return "Not Implemented";
+    case 504:
+        return "Gateway Timeout";
     case 505:
         return "HTTP Version Not Supported";
     default:

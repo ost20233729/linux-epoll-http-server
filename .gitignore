@@ -1,5 +1,6 @@
 minihttpd
 src/*.o
 logs/*.log
+www/uploads/
 *.md
 !README.md

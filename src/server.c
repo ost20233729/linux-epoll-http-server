@@ -1,4 +1,5 @@
 #include "server.h"
+#include "config.h"
 #include "http.h"
 #include "logger.h"
 #include <arpa/inet.h>
@@ -10,10 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /*epoll 只通知哪个 socket 可以读写，epoll实例只有一个。Connection 负责保存这个 socket 应该做什么以及已经做到哪里。*/
@@ -23,7 +26,15 @@
  * running 由信号处理函数修改，其余全局状态只在事件循环线程中访问。
  */
 static volatile sig_atomic_t running = 1; //running — 服务器的开关。初始值是 1（运行）。当用户按 Ctrl+C，内核发 SIGINT 信号，stop_server 被调用，把 running 改成 0。主循环的 while (running) 看到 0 就退出，开始清理。          volatile 告诉编译器：这个变量可能在你不知道的时候被改（信号处理函数是在正常执行流之外被调用的），每次用到它必须从内存重新读，不能用寄存器里的缓存值。
+/* SIGHUP 时置 1，主循环看到后执行热加载。 */
+static volatile sig_atomic_t reload_requested = 0;
+/*
+ * 当前生效的配置。server_config 始终指向它，热加载时整体替换内容。
+ * 事件循环是单线程，替换和读取都发生在同一线程，无需加锁。
+ */
+static ServerConfig current_config;
 static const ServerConfig *server_config;
+static const char *config_file;
 static int epoll_fd = -1;   // epoll_fd — epoll 实例的文件描述符。整个服务器只有一个 epoll 实例，server_run 创建它
 static Connection *connections[MAX_CONNECTIONS];
 
@@ -32,6 +43,13 @@ static void stop_server(int signal_number)
 {
     (void)signal_number;
     running = 0;
+}
+
+/* SIGHUP 处理函数：只置重载标志，真正的重载由主循环完成（信号处理函数必须简单）。 */
+static void reload_server(int signal_number)
+{
+    (void)signal_number;
+    reload_requested = 1;
 }
 
 /* 修改客户端 socket 在 epoll 中关注的事件。 */
@@ -52,8 +70,61 @@ static void release_response(Connection *connection)
     free(connection->body);
     connection->file_fd = -1;
     connection->body = NULL;
-    connection->body_length = connection->body_sent = 0;
+    connection->body_length = connection->body_sent = connection->body_capacity = 0;
     connection->header_length = connection->header_sent = 0;
+}
+
+/*
+ * 中止未完成的上传：关闭文件并删除残留。
+ * 上传失败（客户端提前断开、磁盘写入失败）时调用，避免留下半个文件。
+ */
+static void abort_upload(Connection *connection)
+{
+    if (connection->upload_fd >= 0)
+    {
+        close(connection->upload_fd);
+        unlink(connection->upload_path);
+        connection->upload_fd = -1;
+        connection->upload_path[0] = '\0';
+    }
+}
+
+/*
+ * 终止仍在运行的 CGI 子进程，关闭管道并回收资源。
+ * 连接关闭、CGI 出错或超时时调用；cgi_pid == -1 时不做任何事。
+ */
+static void kill_cgi(Connection *connection)
+{
+    if (connection->cgi_pid > 0)
+    {
+        kill(connection->cgi_pid, SIGKILL);
+        waitpid(connection->cgi_pid, NULL, 0);
+        connection->cgi_pid = -1;
+    }
+    if (connection->cgi_input_fd >= 0)
+    {
+        close(connection->cgi_input_fd);
+        connection->cgi_input_fd = -1;
+    }
+    if (connection->cgi_output_fd >= 0)
+    {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->cgi_output_fd, NULL);
+        close(connection->cgi_output_fd);
+        connection->cgi_output_fd = -1;
+    }
+    /* 一并释放 CGI 请求体缓冲，调用方无需重复清理。 */
+    free(connection->request_body);
+    connection->request_body = NULL;
+    connection->request_body_length = 0;
+    connection->cgi_request = false;
+}
+
+/* 把 CGI stdout 管道读端加入 epoll，开始接收脚本输出。 */
+static int start_cgi_output(Connection *connection)
+{
+    connection->state = CONN_RUNNING_CGI;
+    struct epoll_event event = {.events = EPOLLIN | EPOLLHUP, .data.ptr = connection};
+    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection->cgi_output_fd, &event);
 }
 
 /* 从 epoll、连接表和操作系统中彻底移除一个客户端。 */
@@ -65,6 +136,8 @@ static void close_connection(Connection *connection)
     if (connection->fd >= 0 && connection->fd < MAX_CONNECTIONS)
         connections[connection->fd] = NULL;
     close(connection->fd);
+    abort_upload(connection);
+    kill_cgi(connection); // 回收 CGI 子进程、管道和请求体缓冲
     release_response(connection);
     free(connection);
 }
@@ -148,17 +221,20 @@ static int prepare_error(Connection *connection, int status, const char *detail)
                          status,
                          "text/html; charset=utf-8",
                          length,
-                         status == 405 ? "Allow: GET, HEAD\r\n" : NULL);
+                         status == 405 ? "Allow: GET, HEAD, POST\r\n" : NULL);
 }
 
-/* 向动态字符串末尾追加内容，空间不足时按倍数扩容。 */
-static int append_text(char **buffer, size_t *length, size_t *capacity, const char *text)
+/* 向动态缓冲区追加指定长度的数据，空间不足时按倍数扩容。 */
+static int append_bytes(char **buffer,
+                        size_t *length,
+                        size_t *capacity,
+                        const char *data,
+                        size_t data_length)
 {
-    size_t text_length = strlen(text);
-    if (*length + text_length + 1 > *capacity)
+    if (*length + data_length + 1 > *capacity)
     {
         size_t next = *capacity == 0 ? 4096 : *capacity;
-        while (next < *length + text_length + 1)
+        while (next < *length + data_length + 1)
             next *= 2;// 翻倍直到足够大
 
         // 用 realloc 按需扩容
@@ -169,10 +245,16 @@ static int append_text(char **buffer, size_t *length, size_t *capacity, const ch
         *capacity = next;
     }
 
-    memcpy(*buffer + *length, text, text_length); // 追加到末尾
-    *length += text_length;
+    memcpy(*buffer + *length, data, data_length); // 追加到末尾
+    *length += data_length;
     (*buffer)[*length] = '\0';
     return 0;
+}
+
+/* 向动态字符串末尾追加内容（NUL 结尾文本版，append_bytes 的封装）。 */
+static int append_text(char **buffer, size_t *length, size_t *capacity, const char *text)
+{
+    return append_bytes(buffer, length, capacity, text, strlen(text));
 }
 
 /*
@@ -354,6 +436,231 @@ static int prepare_file(Connection *connection, const char *path, const struct s
     return result;
 }
 
+/* prepare_upload 需要直接消费缓冲区里已到达的请求体，先在这里声明。 */
+static int handle_read_body(Connection *connection);
+
+/*
+ * 准备 POST 上传：把请求体流式写入 document_root/uploads/ 下的目标文件。
+ * 校验顺序：目录限制 → 传输编码 → Content-Length 存在性 → 大小上限 → 路径安全。
+ * 目标文件在请求完成前不存在，realpath 不能解析它，因此先规范化父目录再拼接文件名。
+ */
+static int prepare_upload(Connection *connection, const char *decoded)
+{
+    /* 上传只允许写入 /uploads/ 子目录，避免覆盖站点其他文件。 */
+    if (strncmp(decoded, "/uploads/", 9) != 0 || strlen(decoded) <= 9)
+        return prepare_error(connection, 403, "Uploads are only allowed under /uploads/.");
+
+    if (connection->request.chunked)
+        return prepare_error(connection, 501, "Chunked request bodies are not supported.");
+    if (!connection->request.has_content_length)
+        return prepare_error(connection, 411, "POST requires a Content-Length header.");
+    if (connection->request.content_length > MAX_UPLOAD_SIZE)
+        return prepare_error(connection, 413, "Upload exceeds the 64 MiB limit.");
+
+    char candidate[PATH_MAX];
+    if (snprintf(candidate, sizeof(candidate), "%s%s", server_config->document_root, decoded) >=
+        (int)sizeof(candidate))
+        return prepare_error(connection, 400, "Path is too long.");
+
+    char *slash = strrchr(candidate, '/');
+    if (slash == NULL || slash[1] == '\0')
+        return prepare_error(connection, 400, "Upload path must end with a file name.");
+
+    char parent[PATH_MAX];
+    size_t parent_length = (size_t)(slash - candidate);
+    memcpy(parent, candidate, parent_length);
+    parent[parent_length] = '\0';
+
+    char resolved_parent[PATH_MAX];
+    if (realpath(parent, resolved_parent) == NULL)
+        return prepare_error(connection, 404, "Upload directory does not exist.");
+
+    /* 与普通请求相同的约束：规范化后的父目录必须仍位于网站根目录内。 */
+    size_t root_length = strlen(server_config->document_root);
+    if (strncmp(resolved_parent, server_config->document_root, root_length) != 0 ||
+        (resolved_parent[root_length] != '\0' && resolved_parent[root_length] != '/'))
+        return prepare_error(connection, 403, "Upload directory is outside the document root.");
+
+    if (snprintf(connection->upload_path,
+                 sizeof(connection->upload_path),
+                 "%s/%s",
+                 resolved_parent,
+                 slash + 1) >= (int)sizeof(connection->upload_path))
+        return prepare_error(connection, 400, "Path is too long.");
+
+    /* 同名文件直接覆盖（O_TRUNC）。 */
+    int fd = open(connection->upload_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return prepare_error(connection,
+                             errno == EACCES ? 403 : 500,
+                             "Upload file cannot be created.");
+
+    connection->upload_fd = fd;
+    connection->content_received = 0;
+    connection->state = CONN_READING_BODY;
+
+    /* 缓冲区里可能已经带有部分请求体（甚至流水线中的下一个请求），立即处理。 */
+    if (connection->read_length > 0)
+        return handle_read_body(connection);
+
+    /* 请求体尚未到达，继续等待 EPOLLIN。 */
+    return change_events(connection, EPOLLIN | EPOLLRDHUP);
+}
+
+/*
+ * CGI 子进程：把标准输入输出接到管道后 exec 执行脚本，永远不返回。
+ * 请求信息通过环境变量传递——这是 CGI 协议的核心约定。
+ */
+static void run_cgi_child(const Connection *connection,
+                          const char *path,
+                          const char *decoded,
+                          const int *input_pipe,
+                          const int *output_pipe)
+{
+    dup2(input_pipe[0], STDIN_FILENO);   /* 请求体从管道读入 */
+    dup2(output_pipe[1], STDOUT_FILENO); /* 输出写回管道 */
+    close(input_pipe[0]);
+    close(input_pipe[1]);
+    close(output_pipe[0]);
+    close(output_pipe[1]);
+
+    /* socket、epoll 等 fd 创建时都带 CLOEXEC，exec 时自动关闭；这里显式关闭本连接的。 */
+    close(connection->fd);
+    close(epoll_fd);
+
+    const char *query = strchr(connection->request.target, '?');
+    char content_length[32] = "";
+    if (connection->request.has_content_length)
+        snprintf(content_length,
+                 sizeof(content_length),
+                 "%lld",
+                 (long long)connection->request.content_length);
+    char protocol[16];
+    snprintf(protocol, sizeof(protocol), "HTTP/1.%d", connection->request.http_minor);
+
+    setenv("REQUEST_METHOD",
+           connection->request.method == METHOD_POST ? "POST" : "GET",
+           1);
+    setenv("QUERY_STRING", query != NULL ? query + 1 : "", 1);
+    setenv("SCRIPT_NAME", decoded, 1);
+    setenv("CONTENT_LENGTH", content_length, 1);
+    setenv("CONTENT_TYPE", connection->request.content_type, 1);
+    setenv("GATEWAY_INTERFACE", "CGI/1.1", 1);
+    setenv("SERVER_PROTOCOL", protocol, 1);
+    setenv("REMOTE_ADDR", connection->client_ip, 1);
+    setenv("SERVER_SOFTWARE", SERVER_NAME, 1);
+
+    execl(path, path, (char *)NULL);
+
+    /* exec 失败：按 CGI 格式输出 500，父进程解析响应头时会看到状态码。 */
+    const char message[] = "Status: 500 Internal Server Error\r\n"
+                           "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                           "Cannot execute CGI script.\n";
+    ssize_t ignored = write(STDOUT_FILENO, message, sizeof(message) - 1);
+    (void)ignored;
+    _exit(1);
+}
+
+/*
+ * 准备 CGI 执行：校验脚本、创建管道、fork 子进程。
+ * GET 直接进入输出接收阶段；POST 的请求体先缓冲（≤ 64 KiB），
+ * 收满后一次性写进子进程 stdin——上限恰好等于 Linux 管道容量，
+ * 保证写管道不会阻塞事件循环。
+ */
+static int prepare_cgi(Connection *connection, const char *decoded)
+{
+    /* 脚本必须存在且位于网站根目录内。 */
+    char candidate[PATH_MAX];
+    if (snprintf(candidate, sizeof(candidate), "%s%s", server_config->document_root, decoded) >=
+        (int)sizeof(candidate))
+        return prepare_error(connection, 400, "Path is too long.");
+    char path[PATH_MAX];
+    if (realpath(candidate, path) == NULL)
+        return prepare_error(connection, 404, "CGI script was not found.");
+    size_t root_length = strlen(server_config->document_root);
+    if (strncmp(path, server_config->document_root, root_length) != 0 ||
+        (path[root_length] != '\0' && path[root_length] != '/'))
+        return prepare_error(connection, 403, "CGI script is outside the document root.");
+
+    struct stat info;
+    if (stat(path, &info) != 0 || !S_ISREG(info.st_mode))
+        return prepare_error(connection, 404, "CGI script was not found.");
+    if (access(path, X_OK) != 0)
+        return prepare_error(connection, 403, "CGI script is not executable.");
+
+    if (connection->request.chunked)
+        return prepare_error(connection, 501, "Chunked request bodies are not supported.");
+    if (connection->request.method == METHOD_POST && !connection->request.has_content_length)
+        return prepare_error(connection, 411, "POST requires a Content-Length header.");
+    if (connection->request.content_length > CGI_BODY_MAX)
+        return prepare_error(connection, 413, "CGI request body exceeds the 64 KiB limit.");
+
+    /* 两条管道：input 连接脚本 stdin，output 连接脚本 stdout。 */
+    int input_pipe[2] = {-1, -1};
+    int output_pipe[2] = {-1, -1};
+    if (pipe2(input_pipe, O_CLOEXEC) != 0 || pipe2(output_pipe, O_CLOEXEC) != 0)
+    {
+        if (input_pipe[0] >= 0)
+        {
+            close(input_pipe[0]);
+            close(input_pipe[1]);
+        }
+        if (output_pipe[0] >= 0)
+        {
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+        }
+        return prepare_error(connection, 500, "Cannot create CGI pipes.");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return prepare_error(connection, 500, "Cannot fork CGI process.");
+    }
+
+    if (pid == 0)
+        run_cgi_child(connection, path, decoded, input_pipe, output_pipe);
+
+    /* 父进程：关闭不用的管道端，把脚本输出管道设为非阻塞并接管。 */
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    int flags = fcntl(output_pipe[0], F_GETFL, 0);
+    fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    connection->cgi_pid = (int)pid;
+    connection->cgi_output_fd = output_pipe[0];
+    connection->cgi_started = time(NULL);
+    connection->cgi_status = 200;
+    connection->cgi_content_type[0] = '\0';
+
+    /* POST：请求体缓冲进内存，收满后写进脚本 stdin。 */
+    if (connection->request.has_body)
+    {
+        connection->cgi_input_fd = input_pipe[1];
+        connection->cgi_request = true;
+        connection->request_body = malloc((size_t)connection->request.content_length);
+        if (connection->request_body == NULL)
+        {
+            kill_cgi(connection);
+            return prepare_error(connection, 500, "Out of memory.");
+        }
+        connection->request_body_length = 0;
+        connection->state = CONN_READING_BODY;
+        if (connection->read_length > 0)
+            return handle_read_body(connection);
+        return change_events(connection, EPOLLIN | EPOLLRDHUP);
+    }
+
+    /* GET：没有请求体，关闭写端让脚本读到 EOF，直接进入输出接收。 */
+    close(input_pipe[1]);
+    return start_cgi_output(connection);
+}
+
 /*
  * 将 URL 映射到网站根目录中的真实资源，并选择文件或目录响应。
  * 返回 0 表示响应已经准备好，返回非 0 表示该连接无法继续处理。
@@ -361,7 +668,7 @@ static int prepare_file(Connection *connection, const char *path, const struct s
 static int prepare_request(Connection *connection)
 {
     if (connection->request.method == METHOD_UNSUPPORTED)
-        return prepare_error(connection, 405, "Only GET and HEAD are supported.");
+        return prepare_error(connection, 405, "Only GET, HEAD and POST are supported.");
 
     // URL解码
     char decoded[PATH_MAX];
@@ -370,6 +677,22 @@ static int prepare_request(Connection *connection)
         return prepare_error(connection, 403, "Parent directory traversal is forbidden.");
     if (decode != 0)
         return prepare_error(connection, 400, "Invalid URL encoding.");
+
+    /* /cgi-bin/ 下的脚本交给 CGI 执行，优先于静态文件和上传逻辑。 */
+    if (strncmp(decoded, "/cgi-bin/", 9) == 0)
+    {
+        if (connection->request.method != METHOD_GET && connection->request.method != METHOD_POST)
+            return prepare_error(connection, 405, "CGI scripts only support GET and POST.");
+        return prepare_cgi(connection, decoded);
+    }
+
+    /* POST 上传走独立路径，其余逻辑只服务 GET 和 HEAD。 */
+    if (connection->request.method == METHOD_POST)
+        return prepare_upload(connection, decoded);
+
+    /* GET/HEAD 不允许携带请求体：多余的字节会被当成下一个请求解析。 */
+    if (connection->request.has_body)
+        return prepare_error(connection, 400, "Request body is only supported for POST.");
 
     char candidate[PATH_MAX];
     if (snprintf(candidate, sizeof(candidate), "%s%s", server_config->document_root, decoded) >=
@@ -466,11 +789,270 @@ static int finish_response(Connection *connection)
 }
 
 /*
+ * 解析 CGI 脚本输出的响应头（空行之前的部分），只关心 Status 和 Content-Type。
+ * 解析直接在缓冲区里写 '\0' 截断；返回空行后的正文偏移。
+ */
+static void cgi_parse_headers(Connection *connection, size_t *body_offset)
+{
+    bool found = false;
+    size_t header_end = 0;
+    for (size_t i = 0; i + 3 < connection->body_length; ++i)
+    {
+        if (memcmp(connection->body + i, "\r\n\r\n", 4) == 0)
+        {
+            found = true;
+            header_end = i;
+            break;
+        }
+    }
+    if (!found)
+    {
+        /* 没有空行分隔：全部输出都按正文处理，状态码和类型用默认值。 */
+        *body_offset = 0;
+        return;
+    }
+
+    connection->body[header_end] = '\0'; /* 临时截断，逐行解析 */
+    char *line = connection->body;
+    while (*line != '\0')
+    {
+        char *next = strstr(line, "\r\n");
+        if (next != NULL)
+            *next = '\0';
+        char *colon = strchr(line, ':');
+        if (colon != NULL)
+        {
+            *colon = '\0';
+            char *value = colon + 1;
+            while (*value == ' ' || *value == '\t')
+                ++value;
+            if (strcasecmp(line, "Status") == 0)
+            {
+                errno = 0;
+                long status = strtol(value, NULL, 10);
+                if (errno == 0 && status >= 100 && status <= 999)
+                    connection->cgi_status = (int)status;
+            }
+            else if (strcasecmp(line, "Content-Type") == 0)
+                snprintf(connection->cgi_content_type,
+                         sizeof(connection->cgi_content_type),
+                         "%s",
+                         value);
+        }
+        if (next == NULL)
+            break;
+        line = next + 2;
+    }
+    *body_offset = header_end + 4;
+}
+
+/* 脚本输出读取完毕：回收子进程，解析响应头，转入正常的响应发送路径。 */
+static int finish_cgi(Connection *connection)
+{
+    if (connection->cgi_pid > 0)
+    {
+        waitpid(connection->cgi_pid, NULL, 0);
+        connection->cgi_pid = -1;
+    }
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->cgi_output_fd, NULL);
+    close(connection->cgi_output_fd);
+    connection->cgi_output_fd = -1;
+
+    /* 去掉响应头部分，正文从空行后开始。 */
+    size_t body_offset;
+    cgi_parse_headers(connection, &body_offset);
+    if (connection->body_length > body_offset)
+        memmove(connection->body,
+                connection->body + body_offset,
+                connection->body_length - body_offset);
+    connection->body_length -= body_offset;
+    connection->body_sent = 0;
+    return build_headers(connection,
+                         connection->cgi_status,
+                         connection->cgi_content_type[0] != '\0'
+                             ? connection->cgi_content_type
+                             : "text/html; charset=utf-8",
+                         (off_t)connection->body_length,
+                         NULL);
+}
+
+/*
+ * 处理 CGI stdout 管道可读：把脚本输出追加进 body 缓冲，直到 EOF。
+ * 输出超过 1 MiB 时终止子进程并回 500，防止失控脚本耗尽服务器内存。
+ */
+static int handle_cgi_read(Connection *connection)
+{
+    char buffer[4096];
+    while (1)
+    {
+        ssize_t count = read(connection->cgi_output_fd, buffer, sizeof(buffer));
+        if (count > 0)
+        {
+            connection->last_active = time(NULL);
+            if (connection->body_length + (size_t)count > CGI_OUTPUT_MAX)
+            {
+                kill_cgi(connection);
+                release_response(connection);
+                return prepare_error(connection, 500, "CGI output exceeds the 1 MiB limit.");
+            }
+            if (append_bytes(&connection->body,
+                             &connection->body_length,
+                             &connection->body_capacity,
+                             buffer,
+                             (size_t)count) != 0)
+            {
+                kill_cgi(connection);
+                release_response(connection);
+                return prepare_error(connection, 500, "Out of memory.");
+            }
+            continue;
+        }
+        if (count == 0)
+            return finish_cgi(connection); /* 脚本关闭 stdout，输出完毕 */
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            kill_cgi(connection);
+            release_response(connection);
+            return prepare_error(connection, 500, "Cannot read CGI output.");
+        }
+        return 0; /* 暂时没有更多输出，等下一次 EPOLLIN。 */
+    }
+}
+
+/* POST 请求体收满：一次性写进 CGI stdin 后关闭，转入输出接收。 */
+static int finish_cgi_body(Connection *connection)
+{
+    /* 请求体 ≤ 64 KiB（prepare_cgi 已校验），写入空管道不会阻塞。 */
+    size_t written = 0;
+    while (written < connection->request_body_length)
+    {
+        ssize_t result = write(connection->cgi_input_fd,
+                               connection->request_body + written,
+                               connection->request_body_length - written);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break; /* EPIPE：脚本提前退出，忽略剩余数据。 */
+        }
+        written += (size_t)result;
+    }
+    close(connection->cgi_input_fd);
+    connection->cgi_input_fd = -1;
+    free(connection->request_body);
+    connection->request_body = NULL;
+    connection->request_body_length = 0;
+    connection->cgi_request = false;
+    return start_cgi_output(connection);
+}
+
+/* 把一段已收到的请求体写入上传文件，处理部分写入和 EINTR。 */
+static int write_upload(Connection *connection, const char *data, size_t length)
+{
+    size_t written = 0;
+    while (written < length)
+    {
+        ssize_t result = write(connection->upload_fd, data + written, length - written);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1; /* 磁盘满等错误：关闭连接，abort_upload 删除残留文件。 */
+        }
+        written += (size_t)result;
+    }
+    return 0;
+}
+
+/* 上传完成后的收尾：关闭文件，生成 201 Created 响应。 */
+static int finish_upload(Connection *connection)
+{
+    close(connection->upload_fd);
+    connection->upload_fd = -1;
+    connection->upload_path[0] = '\0'; /* 文件完整落盘，无需再删除。 */
+
+    char page[PATH_MAX + 64];
+    int length = snprintf(page, sizeof(page), "Created: %s\n", connection->request.target);
+    if (length < 0)
+        return -1;
+    connection->body = malloc((size_t)length);
+    if (connection->body == NULL)
+        return -1;
+    memcpy(connection->body, page, (size_t)length);
+    connection->body_length = (size_t)length;
+    connection->body_sent = 0;
+    return build_headers(connection, 201, "text/plain; charset=utf-8", (off_t)length, NULL);
+}
+
+/*
+ * 接收 POST 请求体：把 read_buffer 中属于请求体的字节写入上传文件
+ * （或 CGI 请求时缓冲进内存）。一次 recv 可能把请求体之后的流水线请求
+ * 也带进来，超出 Content-Length 的字节必须原样留在缓冲区里，
+ * 供 Keep-Alive 复用时解析下一个请求。
+ */
+static int handle_read_body(Connection *connection)
+{
+    while (connection->content_received < connection->request.content_length)
+    {
+        /* 缓冲区为空时继续收数据。 */
+        if (connection->read_length == 0)
+        {
+            ssize_t count = recv(connection->fd,
+                                 connection->read_buffer,
+                                 sizeof(connection->read_buffer),
+                                 0);
+            if (count > 0)
+            {
+                connection->read_length = (size_t)count;
+                connection->last_active = time(NULL);
+                continue;
+            }
+            if (count == 0)
+                return -1; /* 客户端提前断开，上传不完整。 */
+            if (errno == EINTR)
+                continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                return -1;
+            return 0; /* 请求体尚未收完，等下一次 EPOLLIN。 */
+        }
+
+        /* 只处理属于请求体的字节，剩余部分留给流水线中的下一个请求。 */
+        off_t remaining = connection->request.content_length - connection->content_received;
+        size_t take = remaining < (off_t)connection->read_length
+                          ? (size_t)remaining
+                          : connection->read_length;
+
+        if (connection->cgi_request)
+        {
+            /* CGI：请求体缓冲进内存，收满后交给子进程 stdin。 */
+            memcpy(connection->request_body + connection->request_body_length,
+                   connection->read_buffer,
+                   take);
+            connection->request_body_length += take;
+        }
+        else if (write_upload(connection, connection->read_buffer, take) != 0)
+            return -1;
+        connection->content_received += (off_t)take;
+        memmove(connection->read_buffer,
+                connection->read_buffer + take,
+                connection->read_length - take);
+        connection->read_length -= take;
+    }
+    return connection->cgi_request ? finish_cgi_body(connection) : finish_upload(connection);
+}
+
+/*
  * 处理 EPOLLIN：循环读取到 EAGAIN，并在缓冲区中寻找完整请求头。
  * 这样既能处理一个请求分多次到达，也能处理多个请求连续到达。
  */
 static int handle_read(Connection *connection)
 {
+    /* POST 请求体阶段不解析请求头，按 Content-Length 接收剩余字节。 */
+    if (connection->state == CONN_READING_BODY)
+        return handle_read_body(connection);
+
     // 循环 recv() 把数据往 read_buffer 里攒，读到 EAGAIN（暂时没数据了）为止；
     while (connection->read_length < sizeof(connection->read_buffer))
     {
@@ -690,7 +1272,12 @@ static void accept_connections(int listener)
             continue;
         }
         connection->fd = fd;
+        /* fd 类字段必须显式设为 -1：calloc 清零后 0 是合法的 stdin，会误关。 */
         connection->file_fd = -1;
+        connection->upload_fd = -1;
+        connection->cgi_pid = -1;
+        connection->cgi_input_fd = -1;
+        connection->cgi_output_fd = -1;
         connection->state = CONN_READING; // 等待客户端发送请求
         connection->last_active = time(NULL);
         if (inet_ntop(
@@ -710,22 +1297,140 @@ static void accept_connections(int listener)
     }
 }
 
-/* 定期关闭超过 Keep-Alive 空闲时间的客户端。 */
+/* 定期清理：CGI 脚本超时强杀并回 504；关闭超过 Keep-Alive 空闲时间的客户端。 */
 static void close_idle_connections(void)
 {
     time_t now = time(NULL);
     for (int fd = 0; fd < MAX_CONNECTIONS; ++fd)
     {
         Connection *connection = connections[fd];
-        if (connection != NULL && now - connection->last_active >= server_config->keepalive_timeout)
+        if (connection == NULL)
+            continue;
+
+        /* CGI 超时以子进程启动时间为准，与连接是否活跃无关。
+           cgi_request 覆盖"POST 请求体还没收完"的阶段，此时子进程同样在运行。 */
+        if ((connection->state == CONN_RUNNING_CGI || connection->cgi_request) &&
+            now - connection->cgi_started >= CGI_TIMEOUT)
+        {
+            log_error("CGI script timed out after %d seconds, killing pid %d",
+                      CGI_TIMEOUT,
+                      connection->cgi_pid);
+            kill_cgi(connection);
+            release_response(connection);
+            if (prepare_error(connection, 504, "CGI script timed out.") != 0)
+                close_connection(connection);
+            continue;
+        }
+
+        if (now - connection->last_active >= server_config->keepalive_timeout)
             close_connection(connection);
     }
 }
 
-/* 创建监听 socket 和 epoll 实例，并运行服务器主事件循环。 */
-int server_run(const ServerConfig *config)
+/*
+ * SIGHUP 热加载：重新解析配置文件并应用新配置。
+ * 顺序：解析 → 校验根目录 → 上传目录 → 重建监听 socket（端口变化）→ 重开日志。
+ * 任何一步失败立即放弃，保持旧配置不变——要么全部生效，要么全部不生效。
+ */
+static void apply_reload(int *listener)
 {
-    server_config = config;// 保存配置指针
+    /* 以当前配置为底，配置文件只覆盖出现的字段。 */
+    ServerConfig fresh = current_config;
+    if (config_parse_file(config_file, &fresh) != 0)
+    {
+        log_error("reload failed: cannot read config file %s, keeping old configuration",
+                  config_file);
+        return;
+    }
+
+    /* 校验新的网站根目录并转换为绝对路径。 */
+    char resolved[PATH_MAX];
+    if (realpath(fresh.document_root, resolved) == NULL)
+    {
+        log_error("reload failed: document root %s does not exist", fresh.document_root);
+        return;
+    }
+    struct stat info;
+    if (stat(resolved, &info) != 0 || !S_ISDIR(info.st_mode))
+    {
+        log_error("reload failed: document root %s is not a directory", fresh.document_root);
+        return;
+    }
+    strcpy(fresh.document_root, resolved);
+
+    /* 新根目录下可能没有上传和 CGI 目录，补建。 */
+    char sub_dir[PATH_MAX];
+    if (snprintf(sub_dir, sizeof(sub_dir), "%s/uploads", resolved) >=
+        (int)sizeof(sub_dir))
+    {
+        log_error("reload failed: document root path is too long");
+        return;
+    }
+    if (mkdir(sub_dir, 0755) != 0 && errno != EEXIST)
+    {
+        log_error("reload failed: cannot create %s: %s", sub_dir, strerror(errno));
+        return;
+    }
+    if (snprintf(sub_dir, sizeof(sub_dir), "%s/cgi-bin", resolved) >= (int)sizeof(sub_dir))
+    {
+        log_error("reload failed: document root path is too long");
+        return;
+    }
+    if (mkdir(sub_dir, 0755) != 0 && errno != EEXIST)
+    {
+        log_error("reload failed: cannot create %s: %s", sub_dir, strerror(errno));
+        return;
+    }
+
+    /* 端口变化：先建好新监听 socket 并加入 epoll，再拆除旧的，监听不中断。 */
+    if (fresh.port != current_config.port)
+    {
+        int new_listener = create_listener(fresh.port);
+        if (new_listener < 0)
+        {
+            log_error("reload failed: cannot bind port %d, keeping old configuration",
+                      fresh.port);
+            return;
+        }
+        struct epoll_event event = {.events = EPOLLIN, .data.ptr = NULL};
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_listener, &event) != 0)
+        {
+            log_error("reload failed: cannot register new listener: %s", strerror(errno));
+            close(new_listener);
+            return;
+        }
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, *listener, NULL);
+        close(*listener);
+        *listener = new_listener;
+    }
+
+    /* 日志路径变化时重开日志文件；失败则保留旧路径，下次 reload 再试。 */
+    if (strcmp(fresh.access_log, current_config.access_log) != 0 ||
+        strcmp(fresh.error_log, current_config.error_log) != 0)
+    {
+        if (logger_reload(fresh.access_log, fresh.error_log) != 0)
+        {
+            log_error("reload: cannot reopen log files, keeping old ones");
+            strcpy(fresh.access_log, current_config.access_log);
+            strcpy(fresh.error_log, current_config.error_log);
+        }
+    }
+
+    current_config = fresh;
+    printf("configuration reloaded: port=%d root=%s\n",
+           current_config.port,
+           current_config.document_root);
+    log_error("configuration reloaded: port=%d root=%s",
+              current_config.port,
+              current_config.document_root);
+}
+
+/* 创建监听 socket 和 epoll 实例，并运行服务器主事件循环。 */
+int server_run(const ServerConfig *config, const char *config_path)
+{
+    server_config = &current_config;
+    current_config = *config; // 拷贝一份：热加载时原地替换，调用方的 config 不再使用
+    config_file = config_path;
 
     // 创建监听 socket
     int listener = create_listener(config->port);
@@ -766,6 +1471,10 @@ int server_run(const ServerConfig *config)
     sigaction(SIGINT, &action, NULL);        // 注册 Ctrl+C
     sigaction(SIGTERM, &action, NULL);       // 注册 kill 命令默认发送的信号
 
+    /* SIGHUP 只置重载标志，真正的重载在主循环里执行。 */
+    action.sa_handler = reload_server;
+    sigaction(SIGHUP, &action, NULL);        // 注册热加载信号
+
     /* 忽略SIGPIPE ，防止个别断线客户端干掉整个服务器 */
     signal(SIGPIPE, SIG_IGN);
 
@@ -781,6 +1490,13 @@ int server_run(const ServerConfig *config)
     // 主循环：里面就一件事：epoll_wait 等事件
     while (running)
     {
+        /* SIGHUP 触发热加载：重新读取配置文件并应用。 */
+        if (reload_requested)
+        {
+            reload_requested = 0;
+            apply_reload(&listener);
+        }
+
         /* epoll_wait 用来等待、获取内核投递的 I/O 就绪事件 */
         int count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // 阻塞等事件。1 秒超时不是白等的，它保证主循环每秒至少醒来一次，去清理空闲的 Keep-Alive 连接。
         if (count < 0)
@@ -804,19 +1520,35 @@ int server_run(const ServerConfig *config)
             }
             uint32_t flags = events[i].events;
             int result = 0;
-            if (flags & (EPOLLERR | EPOLLHUP))
-                result = -1;
+            if (connection->state == CONN_RUNNING_CGI)
+            {
+                /* CGI 运行中：事件可能来自 stdout 管道（输出/EOF），也可能来自
+                   客户端 socket（此时读管道只会得到 EAGAIN，无害）。
+                   管道上的 EPOLLHUP 是子进程关闭写端的正常现象，不是连接错误。 */
+                if (flags & (EPOLLIN | EPOLLERR | EPOLLHUP))
+                    result = handle_cgi_read(connection);
+                if (flags & EPOLLRDHUP)
+                    connection->close_after_response = true;
+            }
+            else
+            {
+                if (flags & (EPOLLERR | EPOLLHUP))
+                    result = -1;
 
-            // 客户端有数据（EPOLLIN）→ handle_read()
-            else if ((flags & EPOLLIN) && connection->state == CONN_READING)
-                result = handle_read(connection);
+                // 客户端有数据（EPOLLIN）→ handle_read()（读请求头或 POST 请求体）
+                else if ((flags & EPOLLIN) && (connection->state == CONN_READING ||
+                                               connection->state == CONN_READING_BODY))
+                    result = handle_read(connection);
 
-            if (flags & EPOLLRDHUP)
-                connection->close_after_response = true;
+                if (flags & EPOLLRDHUP)
+                    connection->close_after_response = true;
 
-            // 客户端可写（EPOLLOUT）→ handle_write()
-            if (result == 0 && (flags & EPOLLOUT) && connection->state != CONN_READING)
-                result = handle_write(connection);
+                // 客户端可写（EPOLLOUT）→ handle_write()
+                // CONN_READING_BODY 阶段只注册 EPOLLIN，这里做防御性排除
+                if (result == 0 && (flags & EPOLLOUT) && connection->state != CONN_READING &&
+                    connection->state != CONN_READING_BODY)
+                    result = handle_write(connection);
+            }
 
             // 出错/断开 → close_connection()
             if (result != 0)

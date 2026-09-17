@@ -1,3 +1,4 @@
+#include "config.h"
 #include "logger.h"
 #include "server.h"
 
@@ -12,35 +13,16 @@
 // static 表示这个函数只在本文件内部使用
 static void usage(const char *program)
 {
-    printf("Usage: %s [-p port] [-r document_root] [-t timeout]\n", program);
+    printf("Usage: %s [-p port] [-r document_root] [-t timeout] [-c config]\n", program);
     printf("  -p port           Listen port (default: 8080)\n");
     printf("  -r document_root  Static file directory (default: ./www)\n");
     printf("  -t seconds        Keep-Alive timeout (default: 10)\n");
-}
-
-/*
- * 将字符串严格转换为指定范围内的整数。
- * 返回 0 表示成功，返回 -1 表示格式错误、溢出或超出范围。
- */
-static int parse_number(const char *text, int minimum, int maximum, int *result)
-{
-    char *end;
-    long value;
-
-    errno = 0; // strtol 不会主动把 errno 清零——它只在发生溢出时把 errno 设为 ERANGE。errno不等于0时为溢出
-    value = strtol(text, &end, 10);
-    if (errno != 0 || *text == '\0' || *end != '\0' || value < minimum || value > maximum)
-    {
-        return -1;
-    }
-
-    *result = (int)value;// result 解引用
-    return 0;  // 调用成功
+    printf("  -c config         Config file (default: ./minihttpd.conf)\n");
 }
 
 int main(int argc, char **argv)
 {
-    /* 先建立默认配置，保存服务器启动所需的配置。再使用命令行参数覆盖其中的字段。 */
+    /* 先建立默认配置，保存服务器启动所需的配置。再使用配置文件、命令行参数逐层覆盖。 */
     ServerConfig config = {
         .port = DEFAULT_PORT,
         .document_root = "./www",
@@ -50,15 +32,51 @@ int main(int argc, char **argv)
     };
     int option;
 
-    /* -p 指定端口，-r 指定网站根目录，-t 指定长连接超时。 */
+    /*
+     * 第一遍解析只找 -c：配置优先级是 命令行参数 > 配置文件 > 默认值，
+     * 所以配置文件必须先加载，之后第二遍解析再用命令行参数覆盖。
+     * getopt 的游标 optind 复位后可以重新解析一遍 argv。
+     */
+    const char *config_path = DEFAULT_CONFIG_PATH;
+    while ((option = getopt(argc, argv, "p:r:t:c:h")) != -1)
+    {
+        if (option == 'c')
+            config_path = optarg;
+        else if (option == 'h')
+        {
+            usage(argv[0]);
+            return EXIT_SUCCESS;
+        }
+        else if (option == '?')
+        {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    optind = 1;
+
+    /*
+     * 配置文件不存在（-1）时继续用默认值；内容错误（-2）则拒绝启动，
+     * 防止服务器带着一份残缺配置运行。
+     */
+    int config_result = config_parse_file(config_path, &config);
+    if (config_result == -2)
+    {
+        fprintf(stderr, "Cannot parse config file: %s\n", config_path);
+        return EXIT_FAILURE;
+    }
+    if (config_result == -1)
+        fprintf(stderr, "Config file %s not found, using defaults.\n", config_path);
+
+    /* -p 指定端口，-r 指定网站根目录，-t 指定长连接超时，-c 指定配置文件。 */
     // 循环每次拿到一个选项字符，就用 switch 分发
-    while ((option = getopt(argc, argv, "p:r:t:h")) != -1)
+    while ((option = getopt(argc, argv, "p:r:t:c:h")) != -1)
     // getopt 会把参数赋值给optarg
     {
         switch (option)
         {
         case 'p':
-            if (parse_number(optarg, 1, 65535, &config.port) != 0)
+            if (config_parse_number(optarg, 1, 65535, &config.port) != 0)
             {
                 // stderr 是标准错误输出
                 fprintf(stderr, "Invalid port: %s\n", optarg);
@@ -76,12 +94,15 @@ int main(int argc, char **argv)
             break;
 
         case 't':
-            if (parse_number(optarg, 1, 3600, &config.keepalive_timeout) != 0)
+            if (config_parse_number(optarg, 1, 3600, &config.keepalive_timeout) != 0)
             {
                 fprintf(stderr, "Invalid timeout: %s\n", optarg);
                 return EXIT_FAILURE;
             }
             break;
+
+        case 'c':
+            break; // 第一遍解析已经处理过。
 
         case 'h':
             usage(argv[0]);
@@ -126,6 +147,31 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* 上传目录和 CGI 脚本目录不存在时创建；已经存在不属于错误。 */
+    char sub_dir[PATH_MAX];
+    if (snprintf(sub_dir, sizeof(sub_dir), "%s/uploads", config.document_root) >=
+        (int)sizeof(sub_dir))
+    {
+        fprintf(stderr, "Document root is too long.\n");
+        return EXIT_FAILURE;
+    }
+    if (mkdir(sub_dir, 0755) != 0 && errno != EEXIST)
+    {
+        perror("create uploads directory");
+        return EXIT_FAILURE;
+    }
+    if (snprintf(sub_dir, sizeof(sub_dir), "%s/cgi-bin", config.document_root) >=
+        (int)sizeof(sub_dir))
+    {
+        fprintf(stderr, "Document root is too long.\n");
+        return EXIT_FAILURE;
+    }
+    if (mkdir(sub_dir, 0755) != 0 && errno != EEXIST)
+    {
+        perror("create cgi-bin directory");
+        return EXIT_FAILURE;
+    }
+
     // 初始化日志：logger_init() 会以追加模式打开两个文件
     if (logger_init(config.access_log, config.error_log) != 0)
     {
@@ -134,7 +180,7 @@ int main(int argc, char **argv)
     }
 
     /* server_run() 进入 epoll 事件循环，直到收到退出信号。 */
-    int result = server_run(&config);  //server_run() 返回后，服务器已经停止
+    int result = server_run(&config, config_path); //server_run() 返回后，服务器已经停止
     logger_close(); //关闭日志access.log和error.log
 
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -51,6 +51,34 @@ int logger_init(const char *access_path, const char *error_path)
     return 0;
 }
 
+/*
+ * 运行中切换日志文件（SIGHUP 热加载调用）。
+ * 先打开两个新文件，全部成功后才关闭旧文件并替换指针：
+ * 任何一步失败都保留旧日志，保证日志记录不中断。
+ */
+int logger_reload(const char *access_path, const char *error_path)
+{
+    FILE *new_access = fopen(access_path, "a");
+    if (new_access == NULL)
+        return -1;
+    FILE *new_error = fopen(error_path, "a");
+    if (new_error == NULL)
+    {
+        fclose(new_access);
+        return -1;
+    }
+    setvbuf(new_access, NULL, _IOLBF, 0);
+    setvbuf(new_error, NULL, _IOLBF, 0);
+
+    if (access_file != NULL)
+        fclose(access_file);
+    if (error_file != NULL)
+        fclose(error_file);
+    access_file = new_access;
+    error_file = new_error;
+    return 0;
+}
+
 /* 关闭两个日志文件，由 main() 在服务器退出后调用。 */
 void logger_close(void)
 {
@@ -79,6 +107,7 @@ void log_access(const Connection *connection)//const Connection *  只能读取�
     // 进行字符转换：request.method 是 HttpMethod 枚举（整数），而 fprintf 要的是字符串，所以转换
     const char *method = connection->request.method == METHOD_GET    ? "GET"
                          : connection->request.method == METHOD_HEAD ? "HEAD"
+                         : connection->request.method == METHOD_POST ? "POST"
                                                                      : "UNKNOWN";
     fprintf(access_file,
             "%s [%s] \"%s %s HTTP/1.%d\" %d %lld %s\n",
