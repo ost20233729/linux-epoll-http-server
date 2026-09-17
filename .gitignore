@@ -6,3 +6,6 @@ www/uploads/
 !README.md
 
 !docs/*.md
+
+# 测试用大文件
+*.bin
