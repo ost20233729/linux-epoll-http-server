@@ -4,3 +4,5 @@ logs/*.log
 www/uploads/
 *.md
 !README.md
+
+!docs/*.md
