@@ -115,6 +115,12 @@ typedef struct Connection
     off_t file_offset;
     off_t file_remaining;
 
+    /* A/B 测试 read+send 路径的发送缓冲与进度：
+       EAGAIN 时保留已发送偏移，避免部分发送进度丢失。 */
+    char send_buffer[READ_BUFFER_SIZE];
+    size_t send_length;
+    size_t send_sent;
+
     /* 连接控制、日志信息和当前请求。 */
     bool keep_alive;
     bool close_after_response;

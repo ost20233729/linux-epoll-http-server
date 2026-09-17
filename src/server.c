@@ -1199,32 +1199,58 @@ static int handle_write(Connection *connection)
         while (connection->file_remaining > 0)
         {
             // A/B 测试开关：环境变量 MINIHTTPD_NO_SENDFILE=1 时用 read+send
-            // 替代 sendfile，用于实测零拷贝的性能收益（见 docs/压测报告.md）
+            // 替代 sendfile，用于实测零拷贝的性能收益（见 docs/压测报告.md）。
+            // send 部分发送遇 EAGAIN 时，进度保存在 connection 的
+            // send_buffer/send_sent 中，下次 EPOLLOUT 继续发剩余部分，
+            // 避免重读文件导致数据错乱。
             if (sendfileDisabled())
             {
-                char buf[64 * 1024];
-                ssize_t n = read(connection->file_fd, buf, sizeof(buf));
-                if (n > 0)
+                if (connection->send_sent == connection->send_length)
                 {
-                    ssize_t sent = 0;
-                    while (sent < n)
+                    ssize_t n = read(connection->file_fd,
+                                     connection->send_buffer,
+                                     sizeof(connection->send_buffer));
+                    if (n > 0)
                     {
-                        ssize_t s = send(connection->fd, buf + sent,
-                                         (size_t)(n - sent), MSG_NOSIGNAL);
-                        if (s > 0) { sent += s; continue; }
-                        if (s < 0 && errno == EINTR) continue;
-                        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                            return 0;
-                        return -1;
+                        connection->send_length = (size_t)n;
+                        connection->send_sent = 0;
                     }
-                    connection->file_remaining -= (size_t)n;
-                    connection->file_offset += n;
+                    else if (n < 0 && errno == EINTR)
+                    {
+                        continue;
+                    }
+                    else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    {
+                        return 0;
+                    }
+                    else
+                    {
+                        return -1; /* 读到 EOF 或错误 */
+                    }
+                }
+
+                const size_t remaining = connection->send_length -
+                                         connection->send_sent;
+                if (remaining == 0)
+                    continue; /* 空文件 */
+                ssize_t s = send(connection->fd,
+                                 connection->send_buffer + connection->send_sent,
+                                 remaining, MSG_NOSIGNAL);
+                if (s > 0)
+                {
+                    connection->send_sent += (size_t)s;
+                    if (connection->send_sent == connection->send_length)
+                    {
+                        connection->file_remaining -=
+                            (off_t)connection->send_length;
+                        connection->file_offset += (off_t)connection->send_length;
+                    }
                     connection->last_active = time(NULL);
                     continue;
                 }
-                if (n < 0 && errno == EINTR)
+                if (s < 0 && errno == EINTR)
                     continue;
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                     return 0;
                 return -1;
             }
